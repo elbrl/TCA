@@ -1,1 +1,143 @@
+#include <Adafruit_MCP4728.h>
+#include <Wire.h>
+#include <LiquidCrystal.h>  // LCD номын сан
+// LCD пинүүд: RS=8, E=9, D4=4, D5=5, D6=6, D7=7
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+Adafruit_MCP4728 mcp;
+#define MAX_LINES 50
+#define ANALOG_PIN A0  
+#define DIGITAL_PIN 0 // Сигналын оролт
 
+// ARM CMSIS регистерүүд
+#define DEMCR       (*((volatile uint32_t *)0xE000EDFC))
+#define DWT_CTRL    (*((volatile uint32_t *)0xE0001000))
+#define DWT_CYCCNT  (*((volatile uint32_t *)0xE0001004))
+#define NOISE_THRESHOLD_NS 1000.0 // 1 µs
+
+String lines[MAX_LINES][2];  // [тоо, хугацаа(ns)]
+int totalLines = 0;          // Хадгалсан мөрийн тоо
+int page = 0;                // Хуудасны индекс
+
+const int buttonPin = A9;    // LCD keypad товчлуурууд унших analog оролт
+
+volatile uint32_t startCycle = 0;
+volatile uint32_t durationCycles = 0;
+volatile bool measured = false;
+
+void enableDWT() {
+  DEMCR |= (1 << 24);   // Trace debug capability асаана
+  DWT_CYCCNT = 0;       // Циклийн тоолуур эхнээс
+  DWT_CTRL |= 1;        // Тоолуурыг асаана
+}
+
+int minValue = 4095;
+int maxValue = 0;
+
+void setup() {
+  Serial.begin(9600);
+  // 12-bit analog уншилтад тохируулна
+  analogReadResolution(12);  // 0–4095 болно
+  lcd.begin(16, 2);         // LCD дэлгэцийг 16x2 горимд эхлүүлэх
+  // DAC эхлүүлнэ
+  if (!mcp.begin()) {
+    Serial.println("MCP4728 not found!");
+    while (1);
+  }
+
+  // 2.5V = 2048 (12-bit DAC)
+  mcp.setChannelValue(MCP4728_CHANNEL_A, 1900);
+  Serial.println("DAC -> 1.5V тавилаа");
+
+  pinMode(DIGITAL_PIN, INPUT);
+  pinMode(ANALOG_PIN, INPUT);
+
+  enableDWT(); // ARM cycle counter идэвхжүүлнэ
+  showPage();               // Эхний хуудас харуулах
+  delay(1000);
+}
+
+void loop() {
+  static bool lastState = LOW;
+  bool currentState = digitalReadFast(DIGITAL_PIN); // хурдан уншилт
+
+  if (currentState != lastState) {
+    if (currentState == HIGH) {
+      startCycle = DWT_CYCCNT;
+    } else {
+      uint32_t endCycle = DWT_CYCCNT;
+
+      // overflow шалгах (32-bit)
+      if (endCycle < startCycle) {
+        durationCycles = (0xFFFFFFFF - startCycle + endCycle + 1);
+      } else {
+        durationCycles = endCycle - startCycle;
+      }
+
+      measured = true;
+    }
+    lastState = currentState;
+  }
+
+  // Хэмжилт хийгдсэн бол үр дүнг хадгалах ба LCD-д харуулах
+  if (measured) {
+    float durationNs = (float)durationCycles * (1e9 / (float)F_CPU); // Циклийг наносекунд рүү хөрвүүлэх
+    if (durationNs >= NOISE_THRESHOLD_NS) {
+      totalLines = (totalLines < MAX_LINES) ? totalLines + 1 : MAX_LINES;
+      int idx = (totalLines == MAX_LINES) ? (totalLines - 1) : (totalLines - 1);
+
+      // Хуучин өгөгдлийг зөөж шинэ утга хадгалах
+      if (totalLines == MAX_LINES) {
+        for (int i = 0; i < MAX_LINES - 1; i++) {
+          lines[i][0] = lines[i + 1][0];
+          lines[i][1] = lines[i + 1][1];
+        }
+        idx = MAX_LINES - 1;
+      }
+
+      lines[idx][0] = String(totalLines);             // Дугаар
+      lines[idx][1] = String(durationNs, 1);          // Хугацаа (нс)
+
+      Serial.print(totalLines);
+      Serial.print("  HIGH pulse duration: ");
+      Serial.print(durationNs, 1);
+      Serial.println(" ns");
+
+      showPage(); // LCD шинэчлэх
+    }
+    measured = false;
+  }
+  // UP / DOWN товч дарагдсан эсэхийг шалгах
+  int btn = analogRead(buttonPin);
+  int totalPages = (totalLines + 1) / 2;
+
+  if (btn < 700) { // UP товч
+    if (page > 0) {
+      page--;
+      showPage();
+      delay(300);
+    }
+  } else if (btn < 1400) { // DOWN товч
+    if (page < totalPages - 1) {
+      page++;
+      showPage();
+      delay(300);
+    }
+  }
+
+}
+
+void showPage() {
+  lcd.clear();
+  int totalPages = (totalLines + 1) / 2;
+  int idx1 = page * 2;
+  int idx2 = idx1 + 1;
+
+  if (idx1 < totalLines) {
+    lcd.setCursor(0, 0);
+    lcd.print(lines[idx1][0] + ":" + lines[idx1][1] + " ns");
+  }
+  if (idx2 < totalLines) {
+    lcd.setCursor(0, 1);
+    lcd.print(lines[idx2][0] + ":" + lines[idx2][1] + " ns");
+  }
+}
