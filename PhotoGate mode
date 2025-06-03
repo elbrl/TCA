@@ -1,0 +1,191 @@
+#include <Adafruit_MCP4728.h>       // Adafruit-ийн MCP4728 DAC-ийн номын сан
+#include <Wire.h>                   // I2C харилцаанд зориулсан номын сан
+#include <LiquidCrystal.h>          // LCD (1602A зэрэг) ашиглахад зориулсан номын сан
+
+Adafruit_MCP4728 mcp;               // MCP4728 DAC объект зарлаж байна
+
+// LCD дэлгэцийн пинүүд: RS, E, D4, D5, D6, D7
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+
+const int buttonPin = A9;           // LCD keypad-ийн analog товчлуурууд орж ирэх пин (Teensy дээр pin 23)
+#define ANALOG_PIN A0               // Аналог оролтын пин (photodiode-оос орж ирэх хүчдэл)
+#define DIGITAL_PIN 0              // Дижитал сигналын оролтын пин (HIGH/LOW дохио)
+
+
+// ARM Cortex-M7 дээрх CMSIS регистерүүдийг шууд ашиглаж DWT (Data Watchpoint and Trace)-г идэвхжүүлж, 
+// цагийн цикл хэмжихэд ашиглана. Энд nanos-д хариу гаргаж болно.
+#define DEMCR       (*((volatile uint32_t *)0xE000EDFC))   // Debug Exception and Monitor Control Register
+#define DWT_CTRL    (*((volatile uint32_t *)0xE0001000))   // DWT Control Register
+#define DWT_CYCCNT  (*((volatile uint32_t *)0xE0001004))   // Cycle Counter Register
+#define NOISE_THRESHOLD_NS 1000.0  // Хэмжилтийн дохионы хамгийн бага утга (1 микросекунд)
+
+#define MAX_LINES 50               // LCD дээр хадгалах боломжтой өгөгдлийн максимум мөр
+
+volatile uint32_t startCycle = 0;     // HIGH дохио эхэлсэн цикл
+volatile uint32_t durationCycles = 0; // HIGH дохионы үргэлжилсэн цикл
+volatile bool measured = false;       // Хэмжилт хийгдсэн эсэх
+
+String lines[MAX_LINES][2];           // Хэмжилтийн өгөгдлийг хадгалах массив (дугаар, хугацаа)
+int totalLines = 0;                   // Нийт хадгалсан өгөгдлийн мөр
+int page = 0;                         // LCD дэлгэц дээрх хуудасны индекс
+
+int minValue = 4095;                  // Аналог хүчдэлийн хамгийн бага утгыг хадгалах хувьсагч
+int maxValue = 0;                     // Аналог хүчдэлийн хамгийн их утга
+
+// Teensy-ийн дотоод цагийн цикл тоологчийг асаах функц
+void enableDWT() {
+  DEMCR |= (1 << 24);    // DWT-д хандалт зөвшөөрөх
+  DWT_CYCCNT = 0;        // Циклийн тоологчийг 0 болгох
+  DWT_CTRL |= 1;         // Циклийн тоологчийг асаах
+}
+
+void setup() {
+  Serial.begin(9600);    // Серийн монитор эхлүүлэх
+  lcd.begin(16, 2);      // LCD 16x2 дэлгэцийг эхлүүлэх
+
+  analogReadResolution(12); // Аналог оролтыг 12-bit нарийвчлалтай болгох
+
+  // DAC инициализаци
+  if (!mcp.begin()) {
+    Serial.println("MCP4728 not found!");
+    while (1); // Хэрэв DAC олдохгүй бол гацна
+  }
+
+  // A суваг дээр 1.7V орчим хүчдэл тавих
+  mcp.setChannelValue(MCP4728_CHANNEL_A, 1900);  
+  Serial.println("DAC -> 1.7V тавилаа");
+
+  // Оролтын пинуудыг тохируулах
+  pinMode(DIGITAL_PIN, INPUT);
+  pinMode(ANALOG_PIN, INPUT);
+
+  enableDWT(); // Дотоод цагийн тоологчийг асаах
+
+  // Photogate-ийн хамгийн бага утгыг хэмжих (3 секундийн турш)
+  Serial.println("MIN утгыг хэмжиж байна...");
+  unsigned long startTime = millis();
+  while (millis() - startTime < 3000) {
+    int sensorValue = analogRead(ANALOG_PIN);
+    if (sensorValue < minValue) minValue = sensorValue;
+    delay(1);
+  }
+
+  // MIN хүчдэлийг тооцоолох (0–3.3V)
+  float minVoltage = (minValue / 4095.0) * 3.3;
+  Serial.print("MIN analog утга: "); Serial.println(minValue);
+  Serial.print("MIN voltage: "); Serial.println(minVoltage, 6);
+
+  // HIGH дохиог хүлээх
+  Serial.println("Фотогэйт HIGH болохыг хүлээж байна...");
+  while (digitalRead(DIGITAL_PIN) == LOW);
+
+  // Photogate-ийн хамгийн их утгыг хэмжих (3 секундийн турш)
+  Serial.println("HIGH . MAX утгыг хэмжиж байна...");
+  startTime = millis();
+  while (millis() - startTime < 3000) {
+    int sensorValue = analogRead(ANALOG_PIN);
+    if (sensorValue > maxValue) maxValue = sensorValue;
+    delay(1);
+  }
+
+  // MAX хүчдэлийг тооцоолох
+  float maxVoltage = (maxValue / 4095.0) * 3.3;
+  Serial.print("MAX analog утга: "); Serial.println(maxValue);
+  Serial.print("MAX voltage: "); Serial.println(maxVoltage, 6);
+
+  // Дундаж утга тооцоолж DAC-д буцаан тавих
+  int averageValue = (maxValue + minValue) / 2;
+  int dacValue = averageValue * 3.3 / 5; // 5V-ийг тооцсон хувиргалт
+  float expectedVoltage = (averageValue / 4095.0) * 3.3;
+  mcp.setChannelValue(MCP4728_CHANNEL_A, dacValue);
+
+  Serial.print("DAC руу буцаан өгсөн дундаж утга: "); Serial.println(averageValue);
+  Serial.print("Тооцоолсон DAC voltage: "); Serial.println(expectedVoltage, 6);
+
+  showPage(); // LCD дээр анхны хуудас харуулах
+  delay(1000);
+}
+
+void loop() {
+  static bool lastState = LOW;
+  bool currentState = digitalReadFast(DIGITAL_PIN); // Дижитал оролтыг хурдан унших
+
+  // Дохио өөрчлөгдвөл HIGH/LOW хугацааг хэмжих
+  if (currentState != lastState) {
+    if (currentState == HIGH) {
+      startCycle = DWT_CYCCNT; // HIGH болсон мөчийн цикл
+    } else {
+      uint32_t endCycle = DWT_CYCCNT;
+      if (endCycle < startCycle)
+        durationCycles = (0xFFFFFFFF - startCycle + endCycle + 1); // Overflow нөхцөл
+      else
+        durationCycles = endCycle - startCycle;
+      measured = true; // Шинэ хэмжилт бэлэн
+    }
+    lastState = currentState;
+  }
+
+  // Хэмжилт хийгдсэн бол үр дүнг хадгалах ба LCD-д харуулах
+  if (measured) {
+    float durationNs = (float)durationCycles * (1e9 / (float)F_CPU); // Циклийг наносекунд рүү хөрвүүлэх
+    if (durationNs >= NOISE_THRESHOLD_NS) {
+      totalLines = (totalLines < MAX_LINES) ? totalLines + 1 : MAX_LINES;
+      int idx = (totalLines == MAX_LINES) ? (totalLines - 1) : (totalLines - 1);
+
+      // Хуучин өгөгдлийг зөөж шинэ утга хадгалах
+      if (totalLines == MAX_LINES) {
+        for (int i = 0; i < MAX_LINES - 1; i++) {
+          lines[i][0] = lines[i + 1][0];
+          lines[i][1] = lines[i + 1][1];
+        }
+        idx = MAX_LINES - 1;
+      }
+
+      lines[idx][0] = String(totalLines);             // Дугаар
+      lines[idx][1] = String(durationNs, 1);          // Хугацаа (нс)
+
+      Serial.print(totalLines);
+      Serial.print("  HIGH pulse duration: ");
+      Serial.print(durationNs, 1);
+      Serial.println(" ns");
+
+      showPage(); // LCD шинэчлэх
+    }
+    measured = false;
+  }
+
+  // UP / DOWN товч дарагдсан эсэхийг шалгах
+  int btn = analogRead(buttonPin);
+  int totalPages = (totalLines + 1) / 2;
+
+  if (btn < 700) { // UP товч
+    if (page > 0) {
+      page--;
+      showPage();
+      delay(300);
+    }
+  } else if (btn < 1400) { // DOWN товч
+    if (page < totalPages - 1) {
+      page++;
+      showPage();
+      delay(300);
+    }
+  }
+}
+
+// LCD дээр тухайн хуудсыг харуулах функц
+void showPage() {
+  lcd.clear();
+  int totalPages = (totalLines + 1) / 2;
+  int idx1 = page * 2;
+  int idx2 = idx1 + 1;
+
+  if (idx1 < totalLines) {
+    lcd.setCursor(0, 0);
+    lcd.print(lines[idx1][0] + ":" + lines[idx1][1] + " ns");
+  }
+  if (idx2 < totalLines) {
+    lcd.setCursor(0, 1);
+    lcd.print(lines[idx2][0] + ":" + lines[idx2][1] + " ns");
+  }
+}
